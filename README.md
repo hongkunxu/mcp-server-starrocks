@@ -57,6 +57,16 @@ Build the image:
 docker build -t mcp-server-starrocks:local .
 ```
 
+Build and push a versioned image:
+
+```bash
+VERSION=0.4.0
+IMAGE=rmc-registry-qa.webex.com/wap-pinot/mcp-starrocks:${VERSION}
+
+docker build -t "${IMAGE}" .
+docker push "${IMAGE}"
+```
+
 Start the server in Streamable HTTP mode:
 
 ```bash
