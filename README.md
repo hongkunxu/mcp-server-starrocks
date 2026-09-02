@@ -93,6 +93,44 @@ Then config the MCP like this:
 }
 ```
 
+**Using Docker:**
+
+Build the image:
+
+```bash
+docker build -t mcp-server-starrocks:local .
+```
+
+Build and push a versioned image:
+
+```bash
+docker build -t <registry>/<namespace>/mcp-starrocks:0.4.0 .
+docker push <registry>/<namespace>/mcp-starrocks:0.4.0
+```
+
+Start the server in Streamable HTTP mode:
+
+```bash
+docker run --rm -p 8000:8000 \
+  -e STARROCKS_HOST=host.docker.internal \
+  -e STARROCKS_PORT=9030 \
+  -e STARROCKS_USER=root \
+  -e STARROCKS_PASSWORD='' \
+  mcp-server-starrocks:local
+```
+
+Then configure the MCP client with:
+
+```json
+{
+  "mcpServers": {
+    "mcp-server-starrocks": {
+      "url": "http://localhost:8000/mcp"
+    }
+  }
+}
+```
+
 
 **Using `uv` with installed package (individual environment variables):**
 
