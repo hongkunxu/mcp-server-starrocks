@@ -17,6 +17,7 @@ The StarRocks MCP Server acts as a bridge between AI assistants and StarRocks da
 - **Data Visualization:** Execute a query and generate a Plotly chart directly from the results (`query_and_plotly_chart`).
 - **Intelligent Caching:** Table and database overviews are cached in memory to speed up repeated requests. Cache can be bypassed when needed.
 - **Flexible Configuration:** Set connection details and behavior via environment variables.
+- **Multiple Named Clusters:** Route one MCP server to multiple isolated StarRocks connection profiles.
 
 ## Prerequisites
 
@@ -101,11 +102,18 @@ Build the image:
 docker build -t mcp-server-starrocks:local .
 ```
 
-Build and push a versioned image:
+Build and push a versioned Linux image (recommended when building from an
+Apple Silicon workstation for an amd64 Kubernetes cluster):
 
 ```bash
-docker build -t <registry>/<namespace>/mcp-starrocks:0.4.0 .
-docker push <registry>/<namespace>/mcp-starrocks:0.4.0
+IMAGE=<registry>/<namespace>/mcp-starrocks:0.0.2
+
+docker buildx build \
+  --platform linux/amd64 \
+  --build-arg APP_VERSION=0.0.2 \
+  --tag "${IMAGE}" \
+  --push \
+  .
 ```
 
 Start the server in Streamable HTTP mode:
@@ -116,6 +124,18 @@ docker run --rm -p 8000:8000 \
   -e STARROCKS_PORT=9030 \
   -e STARROCKS_USER=root \
   -e STARROCKS_PASSWORD='' \
+  mcp-server-starrocks:local
+```
+
+For multiple clusters, mount a non-secret cluster catalog and inject passwords
+through environment variables:
+
+```bash
+docker run --rm -p 8000:8000 \
+  -v "$PWD/clusters.json:/etc/mcp-server-starrocks/clusters.json:ro" \
+  -e STARROCKS_CLUSTERS_FILE=/etc/mcp-server-starrocks/clusters.json \
+  -e STARROCKS_PROD_PASSWORD \
+  -e STARROCKS_STAGING_PASSWORD \
   mcp-server-starrocks:local
 ```
 
@@ -252,6 +272,70 @@ uv run mcp-server-starrocks --test
 ### Connection Configuration
 
 You can configure StarRocks connection using either individual environment variables or a single connection URL:
+
+#### Multiple named clusters
+
+Set either `STARROCKS_CLUSTERS` to a JSON object or
+`STARROCKS_CLUSTERS_FILE` to the path of a JSON file. Do not set both.
+
+```json
+{
+  "default_cluster": "prod",
+  "clusters": {
+    "prod": {
+      "description": "Production analytics",
+      "host": "prod-fe.example.com",
+      "port": 9030,
+      "user": "mcp_reader",
+      "password": "${STARROCKS_PROD_PASSWORD}",
+      "database": "analytics",
+      "ssl_verify_cert": true
+    },
+    "staging": {
+      "url": "mcp_reader@staging-fe.example.com:9030/analytics",
+      "password": "${STARROCKS_STAGING_PASSWORD}"
+    }
+  }
+}
+```
+
+`${NAME}` references are expanded from the server process environment. Startup
+fails when a referenced variable is missing. Passwords and other secrets should
+therefore be injected through the process environment or a Kubernetes Secret,
+not committed to the JSON file.
+
+Supported profile fields are:
+
+- Connection: `url`, `host`, `port`, `user`, `password`, `password_file`,
+  `database` (or `db`).
+- Pool/client: `mysql_auth_plugin`, `pool_size`, `connection_timeout`, `use_pure`.
+- Arrow Flight SQL: `fe_arrow_flight_sql_port`, `fe_arrow_flight_sql_use_tls`.
+- TLS: `ssl_disabled`, `ssl_ca`, `ssl_cert`, `ssl_key`, `ssl_verify_cert`,
+  `ssl_verify_identity`, `tls_versions`.
+- Optional macOS Keychain lookup: `password_keychain_service`,
+  `password_keychain_account`.
+
+Each profile owns an independent connection pool or Arrow Flight SQL connection.
+Connections are created lazily, so an unavailable cluster does not prevent the
+server from starting or other clusters from being used.
+
+When more than one cluster is configured without `default_cluster`, call
+`list_clusters` and `set_session_cluster` before using existing tools. Cluster-aware
+tools also accept an optional `cluster` argument for an explicit per-call override.
+The resolution order is explicit `cluster`, session selection, configured default,
+then the sole configured cluster.
+
+Cluster-specific resources include the cluster id in their URI:
+
+```text
+starrocks:///{cluster}/databases
+starrocks:///{cluster}/{db}/tables
+starrocks:///{cluster}/{db}/{table}/schema
+starrocks-proc:///{cluster}/{path}
+```
+
+If neither multi-cluster setting is present, the existing `STARROCKS_*`
+environment variables continue to configure one cluster named `default`.
 
 **Option 1: Individual Environment Variables**
 

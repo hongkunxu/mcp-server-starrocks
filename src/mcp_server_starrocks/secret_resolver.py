@@ -30,7 +30,16 @@ class KeychainLookupConfig:
     account: str
 
 
-def resolve_password(*, user: str, explicit_password: str, explicit_password_provided: bool) -> str:
+def resolve_password(
+    *,
+    user: str,
+    explicit_password: str,
+    explicit_password_provided: bool,
+    keychain_service: str | None = None,
+    keychain_account: str | None = None,
+    use_environment_keychain: bool = True,
+    password_file: str | None = None,
+) -> str:
     """
     Resolve a StarRocks password.
 
@@ -40,11 +49,19 @@ def resolve_password(*, user: str, explicit_password: str, explicit_password_pro
     if explicit_password_provided:
         return explicit_password
 
-    password_file = os.getenv('STARROCKS_PASSWORD_FILE')
+    if password_file is None and use_environment_keychain:
+        password_file = os.getenv('STARROCKS_PASSWORD_FILE')
     if password_file:
         return read_password_from_file(password_file)
 
-    lookup = get_keychain_lookup_config(user)
+    lookup = None
+    if keychain_service:
+        lookup = KeychainLookupConfig(
+            service=keychain_service,
+            account=keychain_account or user,
+        )
+    elif use_environment_keychain:
+        lookup = get_keychain_lookup_config(user)
     if lookup is None:
         return explicit_password
 

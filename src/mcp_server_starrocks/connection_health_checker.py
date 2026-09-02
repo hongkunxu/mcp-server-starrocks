@@ -109,11 +109,67 @@ class ConnectionHealthChecker:
             self._health_check_thread = None
 
 
+class ClusterConnectionHealthChecker:
+    """Monitor initialized clients without eagerly connecting every cluster."""
+
+    def __init__(self, cluster_manager, check_interval=30):
+        self.cluster_manager = cluster_manager
+        self.check_interval = check_interval
+        self._health_check_thread = None
+        self._health_check_stop_event = threading.Event()
+        self._last_connection_status = {}
+
+    def check_connection_health(self, cluster_id=None):
+        if cluster_id is not None:
+            client = self.cluster_manager.get_client(cluster_id)
+            result = client.execute("show databases")
+            return (True, None) if result.success else (False, result.error_message)
+
+        statuses = {}
+        for initialized_id in self.cluster_manager.initialized_cluster_ids:
+            statuses[initialized_id] = self.check_connection_health(initialized_id)
+        return statuses
+
+    def _connection_health_checker_loop(self):
+        logger.info(f"Starting cluster connection health checker (interval: {self.check_interval}s)")
+        while True:
+            statuses = self.check_connection_health()
+            for cluster_id, (is_healthy, error_msg) in statuses.items():
+                previous = self._last_connection_status.get(cluster_id)
+                if previous != is_healthy:
+                    if is_healthy:
+                        logger.info(f"Database connection is healthy: cluster={cluster_id}")
+                    else:
+                        logger.warning(
+                            f"Database connection is unhealthy: cluster={cluster_id}: {error_msg}"
+                        )
+                self._last_connection_status[cluster_id] = is_healthy
+            if self._health_check_stop_event.wait(self.check_interval):
+                break
+        logger.info("Cluster connection health checker stopped")
+
+    def start(self):
+        if self._health_check_thread is None or not self._health_check_thread.is_alive():
+            self._health_check_stop_event.clear()
+            self._health_check_thread = threading.Thread(
+                target=self._connection_health_checker_loop,
+                name="ClusterConnectionHealthChecker",
+                daemon=True,
+            )
+            self._health_check_thread.start()
+
+    def stop(self):
+        if self._health_check_thread is not None:
+            self._health_check_stop_event.set()
+            self._health_check_thread.join(timeout=5)
+            self._health_check_thread = None
+
+
 # Global instance - will be initialized in server.py
 _health_checker_instance = None
 
 
-def initialize_health_checker(db_client, check_interval=30):
+def initialize_health_checker(db_client=None, check_interval=30, cluster_manager=None):
     """
     Initialize the global connection health checker instance.
     
@@ -122,7 +178,12 @@ def initialize_health_checker(db_client, check_interval=30):
         check_interval: Health check interval in seconds
     """
     global _health_checker_instance
-    _health_checker_instance = ConnectionHealthChecker(db_client, check_interval)
+    if cluster_manager is not None:
+        _health_checker_instance = ClusterConnectionHealthChecker(
+            cluster_manager, check_interval
+        )
+    else:
+        _health_checker_instance = ConnectionHealthChecker(db_client, check_interval)
     return _health_checker_instance
 
 
@@ -143,11 +204,13 @@ def stop_connection_health_checker():
         _health_checker_instance.stop()
 
 
-def check_connection_health():
+def check_connection_health(cluster_id=None):
     """
     Check database connection health by executing a simple query.
     Returns tuple of (is_healthy: bool, error_message: str or None)
     """
     if _health_checker_instance is None:
         raise RuntimeError("Health checker not initialized. Call initialize_health_checker() first.")
+    if isinstance(_health_checker_instance, ClusterConnectionHealthChecker):
+        return _health_checker_instance.check_connection_health(cluster_id)
     return _health_checker_instance.check_connection_health()

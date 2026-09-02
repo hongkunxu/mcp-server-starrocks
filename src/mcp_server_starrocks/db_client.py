@@ -19,7 +19,7 @@ import re
 import json
 import threading
 from contextlib import nullcontext
-from typing import Optional, List, Any, Union, Literal, TypedDict, NotRequired
+from typing import Optional, List, Any, Union, Literal, TypedDict, NotRequired, Mapping
 from dataclasses import dataclass
 import mysql.connector
 from mysql.connector import Error as MySQLError
@@ -211,7 +211,23 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in ('true', '1', 'yes', 'on')
 
 
-def _build_mysql_ssl_options() -> dict:
+def _config_value(config: Mapping[str, Any] | None, key: str, env_name: str, default=None):
+    if config is not None and key in config:
+        return config[key]
+    if config is None:
+        return os.getenv(env_name, default)
+    return default
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ('true', '1', 'yes', 'on')
+
+
+def _build_mysql_ssl_options(config: Mapping[str, Any] | None = None) -> dict:
     """
     Build TLS/SSL connection options for mysql.connector from environment variables.
 
@@ -230,34 +246,42 @@ def _build_mysql_ssl_options() -> dict:
     - For real security, set STARROCKS_SSL_CA together with STARROCKS_SSL_VERIFY_CERT=true
       (and STARROCKS_SSL_VERIFY_IDENTITY=true to also check the hostname).
     """
-    if _env_flag('STARROCKS_SSL_DISABLED', False):
+    if _as_bool(_config_value(config, 'ssl_disabled', 'STARROCKS_SSL_DISABLED'), False):
         return {'ssl_disabled': True}
 
     opts: dict = {}
-    ssl_ca = os.getenv('STARROCKS_SSL_CA')
-    ssl_cert = os.getenv('STARROCKS_SSL_CERT')
-    ssl_key = os.getenv('STARROCKS_SSL_KEY')
+    ssl_ca = _config_value(config, 'ssl_ca', 'STARROCKS_SSL_CA')
+    ssl_cert = _config_value(config, 'ssl_cert', 'STARROCKS_SSL_CERT')
+    ssl_key = _config_value(config, 'ssl_key', 'STARROCKS_SSL_KEY')
     if ssl_ca:
         opts['ssl_ca'] = ssl_ca
     if ssl_cert:
         opts['ssl_cert'] = ssl_cert
     if ssl_key:
         opts['ssl_key'] = ssl_key
-    if _env_flag('STARROCKS_SSL_VERIFY_CERT', False):
+    if _as_bool(_config_value(config, 'ssl_verify_cert', 'STARROCKS_SSL_VERIFY_CERT'), False):
         opts['ssl_verify_cert'] = True
-    if _env_flag('STARROCKS_SSL_VERIFY_IDENTITY', False):
+    if _as_bool(_config_value(config, 'ssl_verify_identity', 'STARROCKS_SSL_VERIFY_IDENTITY'), False):
         opts['ssl_verify_identity'] = True
 
-    tls_versions = os.getenv('STARROCKS_TLS_VERSIONS')
+    tls_versions = _config_value(config, 'tls_versions', 'STARROCKS_TLS_VERSIONS')
     if tls_versions:
-        versions = [v.strip() for v in tls_versions.split(',') if v.strip()]
+        versions = (
+            [str(v).strip() for v in tls_versions if str(v).strip()]
+            if isinstance(tls_versions, list)
+            else [v.strip() for v in str(tls_versions).split(',') if v.strip()]
+        )
         if versions:
             opts['tls_versions'] = versions
 
     return opts
 
 
-def _build_flight_sql_tls(fe_host: str, fe_port: str) -> tuple:
+def _build_flight_sql_tls(
+    fe_host: str,
+    fe_port: str,
+    config: Mapping[str, Any] | None = None,
+) -> tuple:
     """
     Build the Arrow Flight SQL URI and TLS db_kwargs from environment variables.
 
@@ -268,7 +292,14 @@ def _build_flight_sql_tls(fe_host: str, fe_port: str) -> tuple:
 
     Returns a tuple of (uri, tls_db_kwargs).
     """
-    use_tls = _env_flag('STARROCKS_FE_ARROW_FLIGHT_SQL_USE_TLS', False)
+    use_tls = _as_bool(
+        _config_value(
+            config,
+            'fe_arrow_flight_sql_use_tls',
+            'STARROCKS_FE_ARROW_FLIGHT_SQL_USE_TLS',
+        ),
+        False,
+    )
     if not use_tls:
         return f"grpc://{fe_host}:{fe_port}", {}
 
@@ -277,10 +308,13 @@ def _build_flight_sql_tls(fe_host: str, fe_port: str) -> tuple:
     tls_root_certs_key = "adbc.flight.sql.client_option.tls_root_certs"
 
     tls_db_kwargs: dict = {}
-    verify_cert = _env_flag('STARROCKS_SSL_VERIFY_CERT', False)
+    verify_cert = _as_bool(
+        _config_value(config, 'ssl_verify_cert', 'STARROCKS_SSL_VERIFY_CERT'),
+        False,
+    )
     tls_db_kwargs[tls_skip_verify_key] = "false" if verify_cert else "true"
 
-    ssl_ca = os.getenv('STARROCKS_SSL_CA')
+    ssl_ca = _config_value(config, 'ssl_ca', 'STARROCKS_SSL_CA')
     if ssl_ca:
         try:
             with open(ssl_ca, 'r') as f:
@@ -298,62 +332,111 @@ def remove_ansi_codes(text):
   return ANSI_ESCAPE_PATTERN.sub('', text)
 
 
-def _resolve_connection_password(user: str, explicit_password: str, explicit_password_provided: bool) -> str:
+def _resolve_connection_password(
+    user: str,
+    explicit_password: str,
+    explicit_password_provided: bool,
+    allow_environment_fallback: bool = True,
+    keychain_service: str | None = None,
+    keychain_account: str | None = None,
+    password_file: str | None = None,
+) -> str:
     """Resolve password from explicit config, then optional file or Keychain lookup."""
-    if not explicit_password_provided and 'STARROCKS_PASSWORD' in os.environ:
+    if allow_environment_fallback and not explicit_password_provided and 'STARROCKS_PASSWORD' in os.environ:
         explicit_password = os.environ['STARROCKS_PASSWORD']
         explicit_password_provided = True
 
     return resolve_password(
         user=user,
         explicit_password=explicit_password,
-        explicit_password_provided=explicit_password_provided
+        explicit_password_provided=explicit_password_provided,
+        keychain_service=keychain_service,
+        keychain_account=keychain_account,
+        use_environment_keychain=allow_environment_fallback,
+        password_file=password_file,
     )
 
 
 class DBClient:
     """Simplified database client for StarRocks connection and query execution."""
     
-    def __init__(self):
-        self.enable_dummy_test = bool(os.getenv('STARROCKS_DUMMY_TEST'))
-        self.enable_arrow_flight_sql = bool(os.getenv('STARROCKS_FE_ARROW_FLIGHT_SQL_PORT'))
-        if os.getenv('STARROCKS_URL'):
-            self.connection_params, url_password_provided = _parse_connection_url_details(os.getenv('STARROCKS_URL'))
+    def __init__(
+        self,
+        config: Mapping[str, Any] | None = None,
+        cluster_id: str = 'default',
+    ):
+        self.cluster_id = cluster_id
+        self._profile_config = dict(config) if config is not None else None
+        # Preserve the legacy environment-variable behavior: historically any
+        # non-empty value enabled dummy mode. Named profiles use normal boolean
+        # parsing so JSON values such as false behave as expected.
+        self.enable_dummy_test = (
+            bool(os.getenv('STARROCKS_DUMMY_TEST'))
+            if config is None
+            else _as_bool(config.get('dummy_test'), False)
+        )
+        self._flight_sql_port = _config_value(
+            config,
+            'fe_arrow_flight_sql_port',
+            'STARROCKS_FE_ARROW_FLIGHT_SQL_PORT',
+            _config_value(config, 'arrow_flight_sql_port', 'STARROCKS_FE_ARROW_FLIGHT_SQL_PORT'),
+        )
+        self.enable_arrow_flight_sql = bool(self._flight_sql_port)
+        connection_url = _config_value(config, 'url', 'STARROCKS_URL')
+        if connection_url:
+            self.connection_params, url_password_provided = _parse_connection_url_details(str(connection_url))
+            if not url_password_provided and config is not None and 'password' in config:
+                self.connection_params['password'] = str(config.get('password') or '')
+                url_password_provided = True
             self._password_resolution = {
                 'user': self.connection_params['user'],
                 'explicit_password': self.connection_params['password'],
                 'explicit_password_provided': url_password_provided,
+                'allow_environment_fallback': config is None,
+                'keychain_service': _config_value(config, 'password_keychain_service', 'STARROCKS_PASSWORD_KEYCHAIN_SERVICE'),
+                'keychain_account': _config_value(config, 'password_keychain_account', 'STARROCKS_PASSWORD_KEYCHAIN_ACCOUNT'),
+                'password_file': _config_value(config, 'password_file', 'STARROCKS_PASSWORD_FILE'),
             }
             # Convert port to integer for mysql.connector
             self.connection_params['port'] = int(self.connection_params['port'])
         else:
-            user = os.getenv('STARROCKS_USER', 'root')
-            explicit_password = os.getenv('STARROCKS_PASSWORD', '')
-            explicit_password_provided = 'STARROCKS_PASSWORD' in os.environ
+            user = str(_config_value(config, 'user', 'STARROCKS_USER', 'root'))
+            explicit_password = str(_config_value(config, 'password', 'STARROCKS_PASSWORD', '') or '')
+            explicit_password_provided = ('password' in config) if config is not None else ('STARROCKS_PASSWORD' in os.environ)
             self.connection_params = {
-                'host': os.getenv('STARROCKS_HOST', 'localhost'),
-                'port': int(os.getenv('STARROCKS_PORT', '9030')),
+                'host': _config_value(config, 'host', 'STARROCKS_HOST', 'localhost'),
+                'port': int(_config_value(config, 'port', 'STARROCKS_PORT', '9030')),
                 'user': user,
                 'password': explicit_password,
-                'database': os.getenv('STARROCKS_DB', None),
+                'database': _config_value(
+                    config,
+                    'database',
+                    'STARROCKS_DB',
+                    _config_value(config, 'db', 'STARROCKS_DB', None),
+                ),
             }
             self._password_resolution = {
                 'user': user,
                 'explicit_password': explicit_password,
                 'explicit_password_provided': explicit_password_provided,
+                'allow_environment_fallback': config is None,
+                'keychain_service': _config_value(config, 'password_keychain_service', 'STARROCKS_PASSWORD_KEYCHAIN_SERVICE'),
+                'keychain_account': _config_value(config, 'password_keychain_account', 'STARROCKS_PASSWORD_KEYCHAIN_ACCOUNT'),
+                'password_file': _config_value(config, 'password_file', 'STARROCKS_PASSWORD_FILE'),
             }
+        safe_pool_id = re.sub(r'[^A-Za-z0-9._-]', '_', cluster_id)[:40]
         self.connection_params.update(**{
-            'auth_plugin': os.getenv('STARROCKS_MYSQL_AUTH_PLUGIN', 'mysql_native_password'),
-            'pool_size': int(os.getenv('STARROCKS_POOL_SIZE', '10')),
-            'pool_name': 'mcp_starrocks_pool',
+            'auth_plugin': _config_value(config, 'mysql_auth_plugin', 'STARROCKS_MYSQL_AUTH_PLUGIN', 'mysql_native_password'),
+            'pool_size': int(_config_value(config, 'pool_size', 'STARROCKS_POOL_SIZE', '10')),
+            'pool_name': f'mcp_starrocks_{safe_pool_id}',
             'pool_reset_session': True,
             'autocommit': True,
-            'connection_timeout': int(os.getenv('STARROCKS_CONNECTION_TIMEOUT', '10')),
-            'connect_timeout': int(os.getenv('STARROCKS_CONNECTION_TIMEOUT', '10')),
-            'use_pure': os.getenv('STARROCKS_USE_PURE', 'false').lower() in ('true', '1', 'yes'),
+            'connection_timeout': int(_config_value(config, 'connection_timeout', 'STARROCKS_CONNECTION_TIMEOUT', '10')),
+            'connect_timeout': int(_config_value(config, 'connection_timeout', 'STARROCKS_CONNECTION_TIMEOUT', '10')),
+            'use_pure': _as_bool(_config_value(config, 'use_pure', 'STARROCKS_USE_PURE'), False),
         })
         # Apply optional TLS/SSL options for the MySQL protocol connection.
-        self.connection_params.update(_build_mysql_ssl_options())
+        self.connection_params.update(_build_mysql_ssl_options(config))
         self.default_database = self.connection_params.get('database')
 
         # MySQL connection pool
@@ -439,11 +522,11 @@ class DBClient:
         """Create a new ADBC connection."""
         connection_params = self._get_connection_params()
         fe_host = connection_params['host']
-        fe_port = os.getenv('STARROCKS_FE_ARROW_FLIGHT_SQL_PORT', '')
+        fe_port = str(self._flight_sql_port or '')
         user = connection_params['user']
         password = connection_params['password']
         
-        uri, tls_db_kwargs = _build_flight_sql_tls(fe_host, fe_port)
+        uri, tls_db_kwargs = _build_flight_sql_tls(fe_host, fe_port, self._profile_config)
         db_kwargs = {
             adbc_driver_manager.DatabaseOptions.USERNAME.value: user,
             adbc_driver_manager.DatabaseOptions.PASSWORD.value: password,

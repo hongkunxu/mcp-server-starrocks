@@ -36,15 +36,12 @@ from loguru import logger
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware import Middleware
 from .db_client import (
-    get_db_client,
-    reset_db_connections,
     ResultSet,
     PerfAnalysisInput,
     validate_sql_identifier,
     validate_proc_path,
     validate_query_uuid,
 )
-from .db_summary_manager import get_db_summary_manager
 from .query_profile_analytics import (
     QueryProfileAnalyticsTools,
     format_slow_query_analysis,
@@ -53,6 +50,10 @@ from .table_management_tools import (
     TableManagementTools,
     format_top_bad_tables_analysis,
     format_top_hot_tables_analysis,
+)
+from .cluster_manager import (
+    ClusterTargetResolver,
+    get_cluster_manager,
 )
 from .connection_health_checker import (
     initialize_health_checker,
@@ -70,7 +71,7 @@ mcp = FastMCP('mcp-server-starrocks')
 
 # a hint for soft limit, not enforced
 overview_length_limit = int(os.getenv('STARROCKS_OVERVIEW_LIMIT', str(20000)))
-# Global cache for table overviews: {(db_name, table_name): overview_string}
+# Global cache for table overviews: {(cluster_id, db_name, table_name): overview_string}
 global_table_overview_cache = {}
 
 # Directory where read_query writes result files when output_file is a relative path.
@@ -137,15 +138,22 @@ def _write_result_to_file(result: ResultSet, path: str, fmt: str) -> None:
         raise ValueError(
             f"Unsupported format '{fmt}'. Use one of: {', '.join(_SUPPORTED_OUTPUT_FORMATS)}.")
 
-# Get database client instance
-db_client = get_db_client()
-# Get database summary manager instance
-db_summary_manager = get_db_summary_manager(db_client)
-table_management_tools = TableManagementTools(db_client)
-query_profile_analytics_tools = QueryProfileAnalyticsTools(db_client)
-# Description suffix for tools, if default db is set
-description_suffix = f". Global default db is `{db_client.default_database}`; use set_session_db to override per session" \
-    if db_client.default_database else ". Use set_session_db to set a per-session default database"
+# Cluster clients are created lazily.  Legacy STARROCKS_* settings are exposed as
+# one cluster named "default" by the manager.
+cluster_manager = get_cluster_manager()
+target_resolver = ClusterTargetResolver(cluster_manager)
+# Compatibility alias for callers that imported the historical singleton.
+# Multi-cluster request paths always resolve through cluster_manager below.
+db_client = (
+    cluster_manager.get_client(cluster_manager.default_cluster_id)
+    if cluster_manager.default_cluster_id is not None
+    else None
+)
+description_suffix = (
+    ". Uses the explicitly supplied cluster, then the MCP session cluster. "
+    "Call list_clusters and set_session_cluster when multiple clusters are configured. "
+    "Use set_session_db to set a per-session default database."
+)
 
 # Directory where interactive HTML charts are written by query_and_plotly_chart
 # (format="html"). Defaults to the system temp dir.
@@ -197,8 +205,30 @@ def _safe_session_id(ctx: Optional[Context]) -> Optional[str]:
     except (RuntimeError, AttributeError):
         return None
 
+
+def _resolve_cluster(ctx: Optional[Context], cluster: str | None = None) -> str:
+    return target_resolver.resolve(_safe_session_id(ctx), cluster)
+
+
+def _resolve_client(ctx: Optional[Context], cluster: str | None = None):
+    cluster_id = _resolve_cluster(ctx, cluster)
+    if (
+        cluster is None
+        and ctx is None
+        and len(cluster_manager.cluster_ids) == 1
+        and db_client is not None
+    ):
+        return cluster_id, db_client
+    return cluster_id, cluster_manager.get_client(cluster_id)
+
+
+def _structured_result(result: ResultSet, cluster_id: str) -> dict:
+    payload = result.to_dict()
+    payload["cluster_id"] = cluster_id
+    return payload
+
 # Initialize connection health checker
-_health_checker = initialize_health_checker(db_client)
+_health_checker = initialize_health_checker(cluster_manager=cluster_manager)
 
 
 SR_PROC_DESC = '''
@@ -227,8 +257,9 @@ Internal information exposed by StarRocks similar to linux /proc, following are 
 
 @mcp.resource(uri="starrocks:///databases", name="All Databases", description="List all databases in StarRocks",
               mime_type="text/plain")
-def get_all_databases() -> str:
-    logger.debug("Fetching all databases")
+def get_all_databases(ctx: Context = None) -> str:
+    cluster_id, db_client = _resolve_client(ctx)
+    logger.debug(f"Fetching all databases from cluster {cluster_id}")
     result = db_client.execute("SHOW DATABASES")
     logger.debug(f"Found {len(result.rows) if result.success and result.rows else 0} databases")
     return result.to_string()
@@ -236,38 +267,98 @@ def get_all_databases() -> str:
 
 @mcp.resource(uri="starrocks:///{db}/{table}/schema", name="Table Schema",
               description="Get the schema of a table using SHOW CREATE TABLE", mime_type="text/plain")
-def get_table_schema(db: str, table: str) -> str:
+def get_table_schema(db: str, table: str, ctx: Context = None) -> str:
     validate_sql_identifier(db, "database")
     validate_sql_identifier(table, "table")
-    logger.debug(f"Fetching schema for table {db}.{table}")
-    return db_client.execute(f"SHOW CREATE TABLE {db}.{table}").to_string()
+    cluster_id, db_client = _resolve_client(ctx)
+    logger.debug(f"Fetching schema for table {cluster_id}:{db}.{table}")
+    return db_client.execute(f"SHOW CREATE TABLE {db}.{table}", db=db).to_string()
 
 
 @mcp.resource(uri="starrocks:///{db}/tables", name="Database Tables",
               description="List all tables in a specific database", mime_type="text/plain")
-def get_database_tables(db: str) -> str:
+def get_database_tables(db: str, ctx: Context = None) -> str:
     validate_sql_identifier(db, "database")
-    logger.debug(f"Fetching tables from database {db}")
-    result = db_client.execute(f"SHOW TABLES FROM {db}")
+    cluster_id, db_client = _resolve_client(ctx)
+    logger.debug(f"Fetching tables from {cluster_id}:{db}")
+    result = db_client.execute(f"SHOW TABLES FROM {db}", db=db)
     logger.debug(f"Found {len(result.rows) if result.success and result.rows else 0} tables in {db}")
     return result.to_string()
 
 
 @mcp.resource(uri="proc:///{path*}", name="System internal information", description=SR_PROC_DESC,
               mime_type="text/plain")
-def get_system_internal_information(path: str) -> str:
+def get_system_internal_information(path: str, ctx: Context = None) -> str:
     validate_proc_path(path)
-    logger.debug(f"Fetching system information for proc path: {path}")
+    cluster_id, db_client = _resolve_client(ctx)
+    logger.debug(f"Fetching system information for cluster={cluster_id} proc path: {path}")
     return db_client.execute(f"show proc '{path}'").to_string(limit=overview_length_limit)
 
 
-def _get_table_details(db_name, table_name, limit=None):
+@mcp.resource(
+    uri="starrocks:///{cluster}/databases",
+    name="Cluster Databases",
+    description="List all databases in a named StarRocks cluster",
+    mime_type="text/plain",
+)
+def get_cluster_databases(cluster: str) -> str:
+    cluster_id = cluster_manager.validate_cluster_id(cluster)
+    return cluster_manager.get_client(cluster_id).execute("SHOW DATABASES").to_string()
+
+
+@mcp.resource(
+    uri="starrocks:///{cluster}/{db}/tables",
+    name="Cluster Database Tables",
+    description="List tables in a database on a named StarRocks cluster",
+    mime_type="text/plain",
+)
+def get_cluster_database_tables(cluster: str, db: str) -> str:
+    validate_sql_identifier(db, "database")
+    cluster_id = cluster_manager.validate_cluster_id(cluster)
+    return cluster_manager.get_client(cluster_id).execute(
+        f"SHOW TABLES FROM {db}", db=db
+    ).to_string()
+
+
+@mcp.resource(
+    uri="starrocks:///{cluster}/{db}/{table}/schema",
+    name="Cluster Table Schema",
+    description="Get a table schema from a named StarRocks cluster",
+    mime_type="text/plain",
+)
+def get_cluster_table_schema(cluster: str, db: str, table: str) -> str:
+    validate_sql_identifier(db, "database")
+    validate_sql_identifier(table, "table")
+    cluster_id = cluster_manager.validate_cluster_id(cluster)
+    return cluster_manager.get_client(cluster_id).execute(
+        f"SHOW CREATE TABLE {db}.{table}", db=db
+    ).to_string()
+
+
+@mcp.resource(
+    uri="starrocks-proc:///{cluster}/{path*}",
+    name="Cluster System Internal Information",
+    description=SR_PROC_DESC,
+    mime_type="text/plain",
+)
+def get_cluster_system_internal_information(cluster: str, path: str) -> str:
+    validate_proc_path(path)
+    cluster_id = cluster_manager.validate_cluster_id(cluster)
+    return cluster_manager.get_client(cluster_id).execute(
+        f"show proc '{path}'"
+    ).to_string(limit=overview_length_limit)
+
+
+def _get_table_details(cluster_id, db_name, table_name, limit=None):
     """
     Helper function to get description, sample rows, and count for a table.
     Returns a formatted string. Handles DB errors internally and returns error messages.
     """
     global global_table_overview_cache
-    logger.debug(f"Fetching table details for {db_name}.{table_name}")
+    validate_sql_identifier(db_name, "database")
+    validate_sql_identifier(table_name, "table")
+    db_client = cluster_manager.get_client(cluster_id)
+    logger.debug(f"Fetching table details for {cluster_id}:{db_name}.{table_name}")
     output_lines = []
 
     full_table_name = f"`{table_name}`"
@@ -320,16 +411,58 @@ def _get_table_details(db_name, table_name, limit=None):
 
     overview_string = "\n".join(output_lines)
     # Update cache even if there were partial errors, so we cache the error message too
-    cache_key = (db_name, table_name)
+    cache_key = (cluster_id, db_name, table_name)
     global_table_overview_cache[cache_key] = overview_string
     return overview_string
 
 
 # tools
 
+@mcp.tool(description="List configured StarRocks cluster ids and non-secret metadata.")
+def list_clusters() -> str:
+    return json.dumps(
+        {
+            "clusters": cluster_manager.list_clusters(),
+            "default_cluster": cluster_manager.default_cluster_id,
+        },
+        indent=2,
+    )
+
+
+@mcp.tool(description="Set or clear the default StarRocks cluster for THIS MCP session.")
+def set_session_cluster(
+        cluster: Annotated[str | None, Field(
+            description="Configured cluster id. Empty/null clears the session selection.")] = None,
+        ctx: Context = None,
+) -> str:
+    session_id = _safe_session_id(ctx)
+    if not session_id:
+        return "Error: no MCP session id available; cannot set a per-session cluster."
+    selected = target_resolver.set_session_cluster(session_id, cluster or None)
+    if selected:
+        return f"Per-session StarRocks cluster set to `{selected}`."
+    available = ", ".join(cluster_manager.cluster_ids)
+    return (
+        "Cleared per-session cluster. No unambiguous global default is configured. "
+        f"Available clusters: {available}."
+    )
+
+
+@mcp.tool(description="Return the effective StarRocks cluster for THIS MCP session.")
+def get_session_cluster(ctx: Context = None) -> str:
+    selected = target_resolver.get_session_cluster(_safe_session_id(ctx))
+    if selected:
+        return f"Effective StarRocks cluster: `{selected}`."
+    available = ", ".join(cluster_manager.cluster_ids)
+    return f"No cluster selected. Available clusters: {available}."
+
+
 @mcp.tool(description="Execute a SELECT query or commands that return a ResultSet. Set output_file to write the full result to disk instead of returning it inline (useful for large results)." + description_suffix)
 def read_query(query: Annotated[str, Field(description="SQL query to execute")],
                db: Annotated[str|None, Field(description="database")] = None,
+               cluster: Annotated[str|None, Field(
+                   description="Optional StarRocks cluster id; overrides the session cluster."
+               )] = None,
                output_file: Annotated[str|None, Field(
                    description="If set, write the full result to this file and return only a summary + small preview inline. Relative paths resolve against STARROCKS_MCP_OUTPUT_DIR (default: ~/.mcp-server-starrocks/output/). Absolute paths (and ~) are used as-is. Format is inferred from the file extension (.csv, .tsv, .json, .jsonl, .ndjson) unless output_format is given. NOTE: the file is written on the server's filesystem, which may not be the client machine in remote/http deployments."
                )] = None,
@@ -337,12 +470,13 @@ def read_query(query: Annotated[str, Field(description="SQL query to execute")],
                    description="Override file format: csv|tsv|json|jsonl. If omitted, inferred from output_file extension; defaults to csv."
                )] = None,
                ctx: Context = None) -> ToolResult:
-    logger.info(f"Executing read query: {query[:100]}{'...' if len(query) > 100 else ''}")
+    cluster_id, db_client = _resolve_client(ctx, cluster)
+    logger.info(f"Executing read query on cluster={cluster_id}: {query[:100]}{'...' if len(query) > 100 else ''}")
     result = db_client.execute(query, db=db, session_id=_safe_session_id(ctx))
     if not result.success:
         logger.error(f"Query failed: {result.error_message}")
         return ToolResult(content=[TextContent(type='text', text=result.to_string(limit=10000))],
-                          structured_content=result.to_dict())
+                          structured_content=_structured_result(result, cluster_id))
 
     rows_n = len(result.rows) if result.rows else 0
     logger.info(f"Query executed successfully, returned {rows_n} rows")
@@ -357,7 +491,7 @@ def read_query(query: Annotated[str, Field(description="SQL query to execute")],
             return ToolResult(
                 content=[TextContent(type='text',
                                      text=f"Error writing result to file: {e}\n\nResult preview:\n{result.to_string(limit=2000)}")],
-                structured_content=result.to_dict(),
+                structured_content=_structured_result(result, cluster_id),
             )
 
         size = os.path.getsize(resolved)
@@ -369,7 +503,7 @@ def read_query(query: Annotated[str, Field(description="SQL query to execute")],
         preview = result.to_string(limit=2000)
         text = (f"Wrote {rows_n} rows to {resolved} ({size} bytes, format={fmt}).{warn}\n"
                 f"Preview:\n{preview}")
-        structured = result.to_dict()
+        structured = _structured_result(result, cluster_id)
         # full data is on disk now; drop bulky rows from the structured payload
         structured.pop('rows', None)
         structured['output_file'] = resolved
@@ -380,14 +514,18 @@ def read_query(query: Annotated[str, Field(description="SQL query to execute")],
                           structured_content=structured)
 
     return ToolResult(content=[TextContent(type='text', text=result.to_string(limit=10000))],
-                      structured_content=result.to_dict())
+                      structured_content=_structured_result(result, cluster_id))
 
 
 @mcp.tool(description="Execute a DDL/DML or other StarRocks command that do not have a ResultSet" + description_suffix)
 def write_query(query: Annotated[str, Field(description="SQL to execute")],
                 db: Annotated[str|None, Field(description="database")] = None,
+                cluster: Annotated[str|None, Field(
+                    description="Optional StarRocks cluster id; overrides the session cluster."
+                )] = None,
                 ctx: Context = None) -> ToolResult:
-    logger.info(f"Executing write query: {query[:100]}{'...' if len(query) > 100 else ''}")
+    cluster_id, db_client = _resolve_client(ctx, cluster)
+    logger.info(f"Executing write query on cluster={cluster_id}: {query[:100]}{'...' if len(query) > 100 else ''}")
     result = db_client.execute(query, db=db, session_id=_safe_session_id(ctx))
     if not result.success:
         logger.error(f"Write query failed: {result.error_message}")
@@ -396,21 +534,27 @@ def write_query(query: Annotated[str, Field(description="SQL to execute")],
     else:
         logger.info(f"Write query executed successfully in {result.execution_time:.2f}s")
     return ToolResult(content=[TextContent(type='text', text=result.to_string(limit=2000))],
-                      structured_content=result.to_dict())
+                      structured_content=_structured_result(result, cluster_id))
 
 @mcp.tool(description="Analyze top N slowest queries and identify performance bottlenecks")
 def analyze_slow_queries_topn(
         days: Annotated[int, Field(description="Number of days of audit history to analyze")] = 7,
         top_n: Annotated[int, Field(description="Number of slow queries to return")] = 20,
         min_execution_time_ms: Annotated[int, Field(description="Minimum query execution time in milliseconds")] = 1000,
+        cluster: Annotated[str|None, Field(
+            description="Optional StarRocks cluster id; overrides the session cluster."
+        )] = None,
         ctx: Context = None,
 ) -> ToolResult:
     """Analyze top N slow queries and performance patterns."""
+    cluster_id, selected_client = _resolve_client(ctx, cluster)
+    query_profile_analytics_tools = QueryProfileAnalyticsTools(selected_client)
     result = query_profile_analytics_tools.analyze_slow_queries_topn(
         days=days,
         top_n=top_n,
         min_execution_time_ms=min_execution_time_ms,
     )
+    result["cluster_id"] = cluster_id
     return ToolResult(
         content=[TextContent(type='text', text=format_slow_query_analysis(result))],
         structured_content=result,
@@ -423,11 +567,15 @@ def analyze_query(
             str|None, Field(description="Query ID, a string composed of 32 hexadecimal digits formatted as 8-4-4-4-12")]=None,
         sql: Annotated[str|None, Field(description="Query SQL")]=None,
         db: Annotated[str|None, Field(description="database")] = None,
+        cluster: Annotated[str|None, Field(
+            description="Optional StarRocks cluster id; overrides the session cluster."
+        )] = None,
         ctx: Context = None,
 ) -> str:
     sid = _safe_session_id(ctx)
     if db:
         validate_sql_identifier(db, "database")
+    cluster_id, db_client = _resolve_client(ctx, cluster)
     if uuid:
         validate_query_uuid(uuid)
         logger.info(f"Analyzing query profile for UUID: {uuid}")
@@ -444,10 +592,15 @@ def analyze_query(
 def collect_query_dump_and_profile(
         query: Annotated[str, Field(description="query to execute")],
         db: Annotated[str|None, Field(description="database")] = None,
+        cluster: Annotated[str|None, Field(
+            description="Optional StarRocks cluster id; overrides the session cluster."
+        )] = None,
         ctx: Context = None,
 ) -> ToolResult:
-    logger.info(f"Collecting query dump and profile for query: {query[:100]}{'...' if len(query) > 100 else ''}")
+    cluster_id, db_client = _resolve_client(ctx, cluster)
+    logger.info(f"Collecting query dump and profile on cluster={cluster_id} for query: {query[:100]}{'...' if len(query) > 100 else ''}")
     result : PerfAnalysisInput = db_client.collect_perf_analysis_input(query, db=db, session_id=_safe_session_id(ctx))
+    result["cluster_id"] = cluster_id
     if result.get('error_message'):
         status = f"collecting query dump and profile failed, query_id={result.get('query_id')} error_message={result.get('error_message')}"
         logger.warning(status)
@@ -470,8 +623,13 @@ def top_hot_tables(
             description="Optional maximum audit-log timestamp as Unix epoch milliseconds. Applied only when min_start_time_ms is also set.")] = None,
         top_n: Annotated[int, Field(
             description="Number of hot tables to return. Defaults to 20 and is capped at 100.")] = 20,
+        cluster: Annotated[str|None, Field(
+            description="Optional StarRocks cluster id; overrides the session cluster."
+        )] = None,
         ctx: Context = None,
 ) -> ToolResult:
+    cluster_id, selected_client = _resolve_client(ctx, cluster)
+    table_management_tools = TableManagementTools(selected_client)
     result = table_management_tools.get_top_hot_tables(
         db=db,
         table=table,
@@ -479,6 +637,7 @@ def top_hot_tables(
         max_start_time_ms=max_start_time_ms,
         top_n=top_n,
     )
+    result["cluster_id"] = cluster_id
     return ToolResult(
         content=[TextContent(type='text', text=format_top_hot_tables_analysis(result))],
         structured_content=result,
@@ -492,13 +651,19 @@ def top_bad_tables(
             description="Optional table name substring filter. Matches table_name with LIKE.")] = None,
         top_n: Annotated[int, Field(
             description="Number of bad tables to return. Defaults to 20 and is capped at 100.")] = 20,
+        cluster: Annotated[str|None, Field(
+            description="Optional StarRocks cluster id; overrides the session cluster."
+        )] = None,
         ctx: Context = None,
 ) -> ToolResult:
+    cluster_id, selected_client = _resolve_client(ctx, cluster)
+    table_management_tools = TableManagementTools(selected_client)
     result = table_management_tools.get_top_bad_tables(
         db=db,
         table=table,
         top_n=top_n,
     )
+    result["cluster_id"] = cluster_id
     return ToolResult(
         content=[TextContent(type='text', text=format_top_bad_tables_analysis(result))],
         structured_content=result,
@@ -579,6 +744,9 @@ def query_and_plotly_chart(
             str, Field(description="a one function call expression, with 2 vars binded: `px` as `import plotly.express as px`, and `df` as dataframe generated by query `plotly_expr` example: `px.scatter(df, x=\"sepal_width\", y=\"sepal_length\", color=\"species\", marginal_y=\"violin\", marginal_x=\"box\", trendline=\"ols\", template=\"simple_white\")`")],
         format: Annotated[str, Field(description="chart output format: json | png | jpeg | html. 'html' writes an interactive Plotly file to disk and returns its path plus a PNG preview. Defaults to the STARROCKS_CHART_DEFAULT_FORMAT env var, or 'jpeg' if unset.")] = CHART_DEFAULT_FORMAT,
         db: Annotated[str|None, Field(description="database")] = None,
+        cluster: Annotated[str|None, Field(
+            description="Optional StarRocks cluster id; overrides the session cluster."
+        )] = None,
         ctx: Context = None,
 ) -> ToolResult:
     """
@@ -599,7 +767,8 @@ def query_and_plotly_chart(
         or just types.TextContent in case of an error or no data.
     """
     try:
-        logger.info(f'query_and_plotly_chart query:{one_line_summary(query)}, plotly:{one_line_summary(plotly_expr)} format:{format}, db:{db}')
+        cluster_id, db_client = _resolve_client(ctx, cluster)
+        logger.info(f'query_and_plotly_chart cluster:{cluster_id}, query:{one_line_summary(query)}, plotly:{one_line_summary(plotly_expr)} format:{format}, db:{db}')
         result = db_client.execute(query, db=db, return_format="pandas", session_id=_safe_session_id(ctx))
         errmsg = None
         if not result.success:
@@ -623,7 +792,7 @@ def query_and_plotly_chart(
         if format == 'json':
             # return json representation of the figure for front-end rendering
             plot_json = json.loads(fig.to_json())
-            structured_content = result.to_dict()
+            structured_content = _structured_result(result, cluster_id)
             structured_content['data'] = plot_json['data']
             structured_content['layout'] = plot_json['layout']
             summary = result.to_string()
@@ -651,7 +820,7 @@ def query_and_plotly_chart(
                     ),
                 ),
             ]
-            structured_content = result.to_dict()
+            structured_content = _structured_result(result, cluster_id)
             structured_content['html_path'] = fpath
 
             # Also attach a static PNG preview so a chart shows inline in chat
@@ -669,7 +838,7 @@ def query_and_plotly_chart(
             if format == 'jpg':
                 format = 'jpeg'
             img_bytes = fig.to_image(format=format, width=960, height=720)
-            structured_content = result.to_dict()
+            structured_content = _structured_result(result, cluster_id)
             return ToolResult(
                 content=[
                    TextContent(type='text', text=f'dataframe data:\n{df}\nChart generated but for UI only'),
@@ -690,9 +859,14 @@ def table_overview(
             description="Table name, optionally prefixed with database name (e.g., 'db_name.table_name'). If database is omitted, uses the default database.")],
         refresh: Annotated[
             bool, Field(description="Set to true to force refresh, ignoring cache. Defaults to false.")] = False,
+        cluster: Annotated[str|None, Field(
+            description="Optional StarRocks cluster id; overrides the session cluster."
+        )] = None,
         ctx: Context = None,
 ) -> str:
+    cluster_id = None
     try:
+        cluster_id, db_client = _resolve_client(ctx, cluster)
         logger.info(f"Getting table overview for: {table}, refresh={refresh}")
         if not table:
             logger.error("Table overview called without table name")
@@ -716,7 +890,10 @@ def table_overview(
             logger.error(f"No database specified for table {table_name}")
             return f"Error: Database name not specified for table '{table_name}' and no default database is set."
 
-        cache_key = (db_name, table_name)
+        validate_sql_identifier(db_name, "database")
+        validate_sql_identifier(table_name, "table")
+
+        cache_key = (cluster_id, db_name, table_name)
 
         # Check cache
         if not refresh and cache_key in global_table_overview_cache:
@@ -725,12 +902,13 @@ def table_overview(
 
         logger.debug(f"Fetching fresh overview for {db_name}.{table_name}")
         # Fetch details (will also update cache)
-        overview_text = _get_table_details(db_name, table_name, limit=overview_length_limit)
+        overview_text = _get_table_details(cluster_id, db_name, table_name, limit=overview_length_limit)
         return overview_text
     except Exception as e:
         # Reset connections on unexpected errors
         logger.exception(f"Unexpected error in table_overview for {table}")
-        reset_db_connections()
+        if cluster_id:
+            cluster_manager.reset_connections(cluster_id)
         stack_trace = traceback.format_exc()
         return f"Unexpected Error executing tool 'table_overview': {type(e).__name__}: {e}\nStack Trace:\n{stack_trace}"
 
@@ -740,14 +918,19 @@ def db_overview(
         db: Annotated[str, Field(
             description="Database name. Optional: uses the default database if not provided.")] = None,
         refresh: Annotated[
-            bool, Field(description="Set to true to force refresh, ignoring cache. Defaults to false.")] = False
+            bool, Field(description="Set to true to force refresh, ignoring cache. Defaults to false.")] = False,
+        cluster: str | None = None,
+        ctx: Context = None,
 ) -> str:
+    cluster_id = None
     try:
+        cluster_id, db_client = _resolve_client(ctx, cluster)
         db_name = db if db else db_client.default_database
         logger.info(f"Getting database overview for: {db_name}, refresh={refresh}")
         if not db_name:
             logger.error("Database overview called without database name")
             return "Error: Database name not provided and no default database is set."
+        validate_sql_identifier(db_name, "database")
 
         # List tables in the database
         query = f"SHOW TABLES FROM `{db_name}`"
@@ -768,7 +951,7 @@ def db_overview(
         total_length = 0
         limit_per_table = overview_length_limit * (math.log10(len(tables)) + 1) // len(tables)  # Limit per table
         for table_name in tables:
-            cache_key = (db_name, table_name)
+            cache_key = (cluster_id, db_name, table_name)
             overview_text = None
 
             # Check cache first
@@ -778,7 +961,7 @@ def db_overview(
             else:
                 logger.debug(f"Fetching fresh overview for {db_name}.{table_name}")
                 # Fetch details for this table (will update cache via _get_table_details)
-                overview_text = _get_table_details(db_name, table_name, limit=limit_per_table)
+                overview_text = _get_table_details(cluster_id, db_name, table_name, limit=limit_per_table)
 
             all_overviews.append(overview_text)
             all_overviews.append("\n")  # Add separator
@@ -790,7 +973,8 @@ def db_overview(
     except Exception as e:
         # Catch any other unexpected errors during tool execution
         logger.exception(f"Unexpected error in db_overview for database {db}")
-        reset_db_connections()
+        if cluster_id:
+            cluster_manager.reset_connections(cluster_id)
         stack_trace = traceback.format_exc()
         return f"Unexpected Error executing tool 'db_overview': {type(e).__name__}: {e}\nStack Trace:\n{stack_trace}"
 
@@ -803,9 +987,14 @@ def db_summary(
             description="Output length limit in characters. Defaults to 10000. Higher values show more tables and details.")] = 10000,
         refresh: Annotated[bool, Field(
             description="Set to true to force refresh, ignoring cache. Defaults to false.")] = False,
+        cluster: Annotated[str|None, Field(
+            description="Optional StarRocks cluster id; overrides the session cluster."
+        )] = None,
         ctx: Context = None,
 ) -> str:
+    cluster_id = None
     try:
+        cluster_id, db_client = _resolve_client(ctx, cluster)
         db_name = db if db else db_client.get_session_default_db(_safe_session_id(ctx))
         logger.info(f"Getting database summary for: {db_name}, limit={limit}, refresh={refresh}")
         
@@ -814,6 +1003,7 @@ def db_summary(
             return "Error: Database name not provided and no default database is set."
         
         # Use the database summary manager
+        db_summary_manager = cluster_manager.get_summary_manager(cluster_id)
         summary = db_summary_manager.get_database_summary(db_name, limit=limit, refresh=refresh)
         logger.info(f"Database summary completed for {db_name}")
         return summary
@@ -821,7 +1011,8 @@ def db_summary(
     except Exception as e:
         # Reset connections on unexpected errors
         logger.exception(f"Unexpected error in db_summary for database {db}")
-        reset_db_connections()
+        if cluster_id:
+            cluster_manager.reset_connections(cluster_id)
         stack_trace = traceback.format_exc()
         return f"Unexpected Error executing tool 'db_summary': {type(e).__name__}: {e}\nStack Trace:\n{stack_trace}"
 
@@ -830,23 +1021,28 @@ def db_summary(
 def set_session_db(
         db: Annotated[str | None, Field(
             description="Database name to set as the per-session default. Empty/null clears the override.")] = None,
+        cluster: Annotated[str|None, Field(
+            description="Optional StarRocks cluster id; overrides the session cluster."
+        )] = None,
         ctx: Context = None,
 ) -> str:
     session_id = _safe_session_id(ctx)
     if not session_id:
         return "Error: no MCP session id available; cannot set a per-session default database."
+    cluster_id, db_client = _resolve_client(ctx, cluster)
     if not db:
         db_client.set_session_default_db(session_id, None)
         effective = db_client.get_session_default_db(session_id)
         if effective:
-            return f"Cleared per-session default. Falling back to global default `{effective}`."
-        return "Cleared per-session default. No global default is set."
+            return f"Cleared per-session default for cluster `{cluster_id}`. Falling back to global default `{effective}`."
+        return f"Cleared per-session default for cluster `{cluster_id}`. No global default is set."
+    validate_sql_identifier(db, "database")
     # Validate by issuing USE on a real connection.
     probe = db_client.execute(f"USE `{db}`")
     if not probe.success:
         return f"Failed to switch session to `{db}`: {probe.error_message}"
     db_client.set_session_default_db(session_id, db)
-    return f"Per-session default database set to `{db}`."
+    return f"Per-session default database for cluster `{cluster_id}` set to `{db}`."
 
 
 def _build_cors_config() -> tuple[list[str], bool]:
@@ -884,19 +1080,24 @@ async def main():
     global _transport_mode
     _transport_mode = args.mode
 
-    logger.info(f"Starting StarRocks MCP Server with mode={args.mode}, host={args.host}, port={args.port} default_db={db_client.default_database or 'None'}")
+    logger.info(
+        f"Starting StarRocks MCP Server with mode={args.mode}, host={args.host}, "
+        f"port={args.port}, clusters={list(cluster_manager.cluster_ids)}, "
+        f"default_cluster={cluster_manager.default_cluster_id or 'None'}"
+    )
     
     if args.test:
         try:
             logger.info("Starting tool test")
-            # Use the test version without tool wrapper
-            result = db_client.execute("show databases").to_string()
-            logger.info("Result:")
-            logger.info(result)
+            for cluster_id in cluster_manager.cluster_ids:
+                db_client = cluster_manager.get_client(cluster_id)
+                result = db_client.execute("show databases").to_string()
+                logger.info(f"Result for cluster={cluster_id}:")
+                logger.info(result)
             logger.info("Tool test completed")
         finally:
             stop_connection_health_checker()
-            reset_db_connections()
+            cluster_manager.reset_connections()
         return
 
     # Start connection health checker
