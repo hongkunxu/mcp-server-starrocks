@@ -25,7 +25,7 @@ import time
 import tempfile
 from fastmcp import FastMCP, Context
 from fastmcp.utilities.types import Image
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 from mcp.types import TextContent, ImageContent
 from fastmcp.exceptions import ToolError
 from typing import Annotated, Optional
